@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	"github.com/nikitakosatka/hive/pkg/hive"
 )
@@ -26,49 +28,155 @@ type MapState map[string]StateEntry
 // CRDTMapNode is a state-based OR-Map with LWW values.
 type CRDTMapNode struct {
 	*hive.BaseNode
+
+	mu       sync.RWMutex
+	state    MapState
+	counter  uint64
+	allNodes []string
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
-// NewCRDTMapNode creates a CRDT map node for the provided peer set.
 func NewCRDTMapNode(id string, allNodeIDs []string) *CRDTMapNode {
-	panic("Not implemented")
+	return &CRDTMapNode{
+		BaseNode: hive.NewBaseNode(id),
+		state:    make(MapState),
+		counter:  0,
+		allNodes: allNodeIDs,
+		stopCh:   make(chan struct{}),
+	}
 }
 
-// Start starts message processing and anti-entropy broadcast (flood/gossip).
 func (n *CRDTMapNode) Start(ctx context.Context) error {
-	panic("Not implemented")
+	if err := n.BaseNode.Start(ctx); err != nil {
+		return err
+	}
+	n.startAntiEntropy()
+	return nil
 }
 
-// Put writes a value with a fresh local version.
+func (n *CRDTMapNode) startAntiEntropy() {
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				n.broadcastState()
+			case <-n.stopCh:
+				return
+			case <-n.Context().Done():
+				return
+			}
+		}
+	}()
+}
+
+func (n *CRDTMapNode) broadcastState() {
+	state := n.State()
+	for _, nodeID := range n.allNodes {
+		if nodeID == n.ID() {
+			continue
+		}
+		msg := hive.NewMessage(n.ID(), nodeID, state)
+		_ = n.SendMessage(msg)
+	}
+}
+
 func (n *CRDTMapNode) Put(k, v string) {
-	panic("Not implemented")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.counter++
+	ver := Version{Counter: n.counter, NodeID: n.ID()}
+	n.state[k] = StateEntry{
+		Value:     v,
+		Tombstone: false,
+		Version:   ver,
+	}
 }
 
-// Get returns the current visible value for key k.
 func (n *CRDTMapNode) Get(k string) (string, bool) {
-	panic("Not implemented")
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	entry, ok := n.state[k]
+	if !ok || entry.Tombstone {
+		return "", false
+	}
+	return entry.Value, true
 }
 
-// Delete marks the key as removed via a tombstone.
 func (n *CRDTMapNode) Delete(k string) {
-	panic("Not implemented")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.counter++
+	ver := Version{Counter: n.counter, NodeID: n.ID()}
+	n.state[k] = StateEntry{
+		Value:     "",
+		Tombstone: true,
+		Version:   ver,
+	}
 }
 
-// Merge joins local state with a remote state snapshot.
 func (n *CRDTMapNode) Merge(remote MapState) {
-	panic("Not implemented")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for k, remoteEntry := range remote {
+		localEntry, exists := n.state[k]
+		if !exists || n.isNewer(remoteEntry.Version, localEntry.Version) {
+			n.state[k] = remoteEntry
+		}
+	}
 }
 
-// State returns a copy of the full CRDT state.
+func (n *CRDTMapNode) isNewer(a, b Version) bool {
+	if a.Counter != b.Counter {
+		return a.Counter > b.Counter
+	}
+	return a.NodeID > b.NodeID
+}
+
 func (n *CRDTMapNode) State() MapState {
-	panic("Not implemented")
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	copyState := make(MapState)
+	for k, v := range n.state {
+		copyState[k] = v
+	}
+	return copyState
 }
 
-// ToMap returns a value-only map view without tombstones.
 func (n *CRDTMapNode) ToMap() map[string]string {
-	panic("Not implemented")
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	result := make(map[string]string)
+	for k, entry := range n.state {
+		if !entry.Tombstone {
+			result[k] = entry.Value
+		}
+	}
+	return result
 }
 
-// Receive applies remote state snapshots.
+func (n *CRDTMapNode) Stop() error {
+	close(n.stopCh)
+	n.wg.Wait()
+	return n.BaseNode.Stop()
+}
+
 func (n *CRDTMapNode) Receive(msg *hive.Message) error {
-	panic("Not implemented")
+	remoteState, ok := msg.Payload.(MapState)
+	if !ok {
+		return nil
+	}
+	n.Merge(remoteState)
+	return nil
 }
